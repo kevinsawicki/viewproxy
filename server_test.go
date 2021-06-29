@@ -352,17 +352,20 @@ func TestPrerequestCallback(t *testing.T) {
 	done := make(chan struct{})
 
 	server := NewServer("http://fake.net")
-	server.PreRequest = func(w http.ResponseWriter, r *http.Request) {
-		defer close(done)
-		w.Header().Set("x-viewproxy", "true")
-		assert.Equal(t, "192.168.1.1", r.RemoteAddr)
+	server.Handler = func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer close(done)
+			w.Header().Set("x-viewproxy", "true")
+			assert.Equal(t, "192.168.1.1", r.RemoteAddr)
+			h.ServeHTTP(w, r)
+		})
 	}
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/", nil)
 	r.RemoteAddr = "192.168.1.1"
 
-	server.ServeHTTP(w, r)
+	server.createHandler().ServeHTTP(w, r)
 
 	resp := w.Result()
 
@@ -378,9 +381,12 @@ func TestOnErrorHandler(t *testing.T) {
 
 	server := NewServer(targetServer.URL)
 	server.Get("/hello/:name", NewFragment("/definitely_missing_and_not_defined"), []*Fragment{})
-	server.PreRequest = func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("x-viewproxy", "true")
-		assert.Equal(t, "192.168.1.1", r.RemoteAddr)
+	server.Handler = func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("x-viewproxy", "true")
+			assert.Equal(t, "192.168.1.1", r.RemoteAddr)
+			h.ServeHTTP(w, r)
+		})
 	}
 	server.OnError = func(w http.ResponseWriter, r *http.Request, e error) {
 		defer close(done)
@@ -399,7 +405,7 @@ func TestOnErrorHandler(t *testing.T) {
 	fakeRequest := httptest.NewRequest("GET", "/hello/world", nil)
 	fakeRequest.RemoteAddr = "192.168.1.1"
 
-	server.ServeHTTP(fakeWriter, fakeRequest)
+	server.createHandler().ServeHTTP(fakeWriter, fakeRequest)
 
 	assert.Equal(t, "true", fakeWriter.Header().Get("x-viewproxy"))
 

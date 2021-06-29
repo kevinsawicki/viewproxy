@@ -12,7 +12,6 @@ import (
 	"github.com/blakewilliams/viewproxy/internal/tracing"
 	"github.com/blakewilliams/viewproxy/pkg/multiplexer"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // Re-export ResultError for convenience
@@ -51,8 +50,8 @@ type Server struct {
 	// The transport passed to `http.Client` when fetching fragments or proxying
 	// requests.
 	HttpTransport http.RoundTripper
-	// A function that is called before the request is handled by viewproxy.
-	PreRequest    func(w http.ResponseWriter, r *http.Request)
+	// A handler function called to add middleware around the request being handled by viewproxy.
+	WrapHandler   func(http.Handler) http.Handler
 	tracingConfig tracing.TracingConfig
 	// A function that is called when an error occurs in the viewproxy handler
 	OnError func(w http.ResponseWriter, r *http.Request, e error)
@@ -66,7 +65,7 @@ func NewServer(target string) *Server {
 		Port:             3005,
 		ProxyTimeout:     time.Duration(10) * time.Second,
 		PassThrough:      false,
-		PreRequest:       func(http.ResponseWriter, *http.Request) {},
+		WrapHandler:      func(h http.Handler) http.Handler { return h },
 		target:           target,
 		ignoreHeaders:    make([]string, 0),
 		routes:           make([]Route, 0),
@@ -145,15 +144,17 @@ func (s *Server) matchingRoute(path string) (*Route, map[string]string) {
 	return nil, nil
 }
 
+func (s *Server) createHandler() http.Handler {
+	next := s.WrapHandler(s)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tracer := otel.Tracer("server")
+		ctx, span := tracer.Start(r.Context(), "ServeHTTP")
+		defer span.End()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
-
-	tracer := otel.Tracer("server")
-	var span trace.Span
-	ctx, span = tracer.Start(ctx, "ServeHTTP")
-	defer span.End()
-
-	s.PreRequest(w, r)
 	route, parameters := s.matchingRoute(r.URL.Path)
 
 	if route != nil {
@@ -180,7 +181,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		req.WithHeadersFromRequest(r)
-		results, err := req.Do(ctx)
+		results, err := req.Do(r.Context())
 
 		if err != nil {
 			if s.OnError != nil {
@@ -223,7 +224,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		req.WithHeadersFromRequest(r)
 		result, err := req.DoSingle(
-			ctx,
+			r.Context(),
 			r.Method,
 			targetUrl.String(),
 			r.Body,
@@ -265,7 +266,7 @@ func (s *Server) ListenAndServe() error {
 
 	s.httpServer = &http.Server{
 		Addr:           fmt.Sprintf(":%d", s.Port),
-		Handler:        s,
+		Handler:        s.createHandler(),
 		ReadTimeout:    10 * time.Second,
 		WriteTimeout:   10 * time.Second,
 		MaxHeaderBytes: 1 << 20,
